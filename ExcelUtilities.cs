@@ -6,13 +6,12 @@ using DocumentFormat.OpenXml.Spreadsheet;
 using DocumentFormat.OpenXml;
 using System.IO;
 using System.Text.RegularExpressions;
+using System.Reflection;
 
 namespace dotnet_excel_utilities
 {
     /*
      * ToDo:
-     *      - Handle empty cells on export/import 
-     *        https://stackoverflow.com/questions/36100011/c-sharp-open-xml-empty-cells-are-getting-skipped-while-getting-data-from-excel
      *      - Handle other cell value types
      *      - Column auto width
      *      - Header and Column cell styling
@@ -149,12 +148,34 @@ namespace dotnet_excel_utilities
                 .ToList();
 
             // Table header
+            // ...
             currentTableRowIndex++;
 
             // Table columns and data are one level deeper
             tableDepth++;
 
             // Table columns
+            Dictionary<string, PropertyInfo> tableColumns = new Dictionary<string, PropertyInfo>();
+            var columnsRow = sheetRows.ElementAt(currentTableRowIndex);
+            var columnsRowCells = columnsRow.Elements<Cell>().Where(c => c.CellValue != null).ToList();
+            foreach (var property in tableProperties)
+            {
+                ExportColumnAttribute propertyConfig = (ExportColumnAttribute)property
+                    .GetCustomAttributes(typeof(ExportColumnAttribute), false).First();
+                
+                string columnTitle = propertyConfig.Title ?? property.Name.ToString();
+
+                var columnRowCell = columnsRowCells.ElementAtOrDefault(tableProperties.IndexOf(property));
+                if (columnRowCell is null)
+                    throw new Exception($"Invalid table structure [RowIndex: {currentTableRowIndex + 1}]");
+
+                string columnRowCellValue = GetCellValue(columnRowCell, sheetSharedStringTable);
+                if (columnTitle != columnRowCellValue)
+                    throw new Exception($"Invalid table structure [RowIndex: {currentTableRowIndex + 1}]");
+                
+                tableColumns.Add(GetColumnLetter(columnRowCell.CellReference), property);
+            }
+            
             currentTableRowIndex++;
 
             // Table data
@@ -167,17 +188,17 @@ namespace dotnet_excel_utilities
                 {
                     dataObj = new TData();
 
-                    var dataRowCells = dataRow.Elements<Cell>().Where(c => c.CellValue != null).ToList();
+                    var dataRowCells = dataRow.Descendants<Cell>().Where(c => c.CellValue != null).ToList();
 
-                    foreach (var property in tableProperties)
+                    foreach (var column in tableColumns)
                     {
-                        var dataRowCell = dataRowCells.ElementAtOrDefault(tableProperties.IndexOf(property));
+                        var dataRowCell = dataRowCells.FirstOrDefault(c => c.CellReference == $"{column.Key}{currentTableRowIndex + 1}");
                         if (dataRowCell is null)
                             continue;
 
                         string dataRowCellValue = GetCellValue(dataRowCell, sheetSharedStringTable);
 
-                        property.SetValue(dataObj, dataRowCellValue, null);
+                        column.Value.SetValue(dataObj, dataRowCellValue, null);
                     }
 
                     importedData.Add(dataObj);
@@ -580,9 +601,22 @@ namespace dotnet_excel_utilities
             return colLetters;
         }
 
-        private static String GetColumnName(int Index)
+        private static string GetColumnName(int Index)
         {
             return IncrementColumnName("A", Index - 1).ToString();
+        }
+
+        private static string GetColumnLetter(string cellReference)
+        {
+            string reg = @"^([A-Za-z]+)(\d+)$";
+            Match m = Regex.Match(cellReference, reg);
+
+            if (!m.Success)
+            {
+                throw new ArgumentException(cellReference + " is not a valid cell reference");
+            }
+            
+            return m.Groups[1].Value.ToUpper();
         }
 
         #endregion Helpers
