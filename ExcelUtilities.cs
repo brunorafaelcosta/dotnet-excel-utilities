@@ -1,21 +1,20 @@
 using System;
-using System.Collections.Generic;
-using DocumentFormat.OpenXml.Packaging;
-using System.Linq;
-using DocumentFormat.OpenXml.Spreadsheet;
-using DocumentFormat.OpenXml;
 using System.IO;
-using System.Text.RegularExpressions;
+using System.Linq;
 using System.Reflection;
+using System.Collections.Generic;
+using System.Text.RegularExpressions;
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Spreadsheet;
 
 namespace dotnet_excel_utilities
 {
     /*
      * ToDo:
-     *      - Handle other cell value types
      *      - Column auto width
      *      - Header and Column cell styling
-     *      - Import exception handling
+     *      - Import/Export exception handling
      */
     public class ExcelUtilities
     {
@@ -49,7 +48,14 @@ namespace dotnet_excel_utilities
         [AttributeUsage(AttributeTargets.Property, Inherited = false, AllowMultiple = false)]
         public class ExportColumnAttribute : Attribute
         {
+            public ExportColumnAttribute(ColumnType columnType = ColumnType.String)
+            {
+                ColumnType = columnType;
+            }
+
             public string Title { get; set; }
+
+            public ColumnType ColumnType { get; set; }
         }
 
         [AttributeUsage(AttributeTargets.Property, Inherited = false, AllowMultiple = false)]
@@ -64,6 +70,16 @@ namespace dotnet_excel_utilities
         }
 
         #endregion Configuration Attributes
+
+        public enum ColumnType
+        {
+            String = 1,
+            Int32,
+            Int64,
+            Decimal,
+            Boolean,
+            DateTime
+        }
 
         public interface IData { }
 
@@ -155,25 +171,25 @@ namespace dotnet_excel_utilities
             tableDepth++;
 
             // Table columns
-            Dictionary<string, PropertyInfo> tableColumns = new Dictionary<string, PropertyInfo>();
+            Dictionary<string, Tuple<PropertyInfo, ExportColumnAttribute>> tableColumns = new Dictionary<string, Tuple<PropertyInfo, ExportColumnAttribute>>();
             var columnsRow = sheetRows.ElementAt(currentTableRowIndex);
             var columnsRowCells = columnsRow.Elements<Cell>().Where(c => c.CellValue != null).ToList();
             foreach (var property in tableProperties)
             {
                 ExportColumnAttribute propertyConfig = (ExportColumnAttribute)property
                     .GetCustomAttributes(typeof(ExportColumnAttribute), false).First();
-                
+
                 string columnTitle = propertyConfig.Title ?? property.Name.ToString();
 
                 var columnRowCell = columnsRowCells.ElementAtOrDefault(tableProperties.IndexOf(property));
                 if (columnRowCell is null)
                     throw new Exception($"Invalid table structure [RowIndex: {currentTableRowIndex + 1}]");
 
-                string columnRowCellValue = GetCellValue(columnRowCell, sheetSharedStringTable);
+                string columnRowCellValue = (string)GetCellValue(ColumnType.String, columnRowCell, sheetSharedStringTable);
                 if (columnTitle != columnRowCellValue)
                     throw new Exception($"Invalid table structure [RowIndex: {currentTableRowIndex + 1}]");
                 
-                tableColumns.Add(GetColumnLetter(columnRowCell.CellReference), property);
+                tableColumns.Add(GetColumnLetter(columnRowCell.CellReference), new Tuple<PropertyInfo, ExportColumnAttribute>(property, propertyConfig));
             }
             
             currentTableRowIndex++;
@@ -196,9 +212,9 @@ namespace dotnet_excel_utilities
                         if (dataRowCell is null)
                             continue;
 
-                        string dataRowCellValue = GetCellValue(dataRowCell, sheetSharedStringTable);
+                        object dataRowCellValue = GetCellValue(column.Value.Item2.ColumnType, dataRowCell, sheetSharedStringTable);
 
-                        column.Value.SetValue(dataObj, dataRowCellValue, null);
+                        column.Value.Item1.SetValue(dataObj, dataRowCellValue, null);
                     }
 
                     importedData.Add(dataObj);
@@ -317,7 +333,7 @@ namespace dotnet_excel_utilities
             DocumentFormat.OpenXml.Spreadsheet.Cell headerCell;
             headerCell = ExportSheetCell(ref worksheetPart, ref sheetData, ref sheet,
                 nextRowIndex, depth, RowType.Header, 0,
-                tableConfig.Header,
+                ColumnType.String, tableConfig.Header,
                 true, false);
             MergeCells(worksheetPart, headerCell.CellReference, IncrementColumn(headerCell.CellReference, properties.Count));
 
@@ -327,6 +343,8 @@ namespace dotnet_excel_utilities
             depth++;
 
             // Table columns
+            Dictionary<int, Tuple<PropertyInfo, ExportColumnAttribute>> tableColumns = new Dictionary<int, Tuple<PropertyInfo, ExportColumnAttribute>>();
+            int columIndex = 0;
             foreach (var property in properties)
             {
                 ExportColumnAttribute propertyConfig = (ExportColumnAttribute)property
@@ -336,21 +354,26 @@ namespace dotnet_excel_utilities
                 DocumentFormat.OpenXml.Spreadsheet.Cell cell;
                 cell = ExportSheetCell(ref worksheetPart, ref sheetData, ref sheet,
                     nextRowIndex, depth, RowType.Column, properties.IndexOf(property),
-                    columnTitle,
+                    ColumnType.String, columnTitle,
                     true, false);
+                
+                tableColumns.Add(columIndex, new Tuple<PropertyInfo, ExportColumnAttribute>(property, propertyConfig));
+
+                columIndex++;
             }
 
             // Table rows
-            foreach (var dataRow in data)
+            foreach (var tableRow in data)
             {
                 nextRowIndex = (uint)sheetData.Elements<Row>().Count() + 1;
 
-                foreach (var property in properties)
+                foreach (var tableColumn in tableColumns)
                 {
-                    string propertyValue = property.GetValue(dataRow)?.ToString() ?? string.Empty;
+                    string propertyValue = Convert.ToString(tableColumn.Value.Item1.GetValue(tableRow)) ?? null;
+
                     ExportSheetCell(ref worksheetPart, ref sheetData, ref sheet,
-                        nextRowIndex, depth, RowType.Data, properties.IndexOf(property),
-                        propertyValue,
+                        nextRowIndex, depth, RowType.Data, tableColumn.Key,
+                        tableColumn.Value.Item2.ColumnType, propertyValue,
                         true, false);
                 }
 
@@ -369,15 +392,15 @@ namespace dotnet_excel_utilities
                             continue;
 
                         ExportSheetData(ref worksheetPart, ref sheetData, ref sheet, 
-                            (IEnumerable<IData>)childProperty.GetValue(dataRow), depth + 1, columnTableConfig.IsCollapsed, isCollapsed);
+                            (IEnumerable<IData>)childProperty.GetValue(tableRow), depth + 1, columnTableConfig.IsCollapsed, isCollapsed);
                     }
                 }
             }
         }
 
-        private static DocumentFormat.OpenXml.Spreadsheet.Cell ExportSheetCell(ref WorksheetPart worksheetPart, ref SheetData sheetData, ref Sheet sheet,
+        private static Cell ExportSheetCell(ref WorksheetPart worksheetPart, ref SheetData sheetData, ref Sheet sheet,
             uint rowIndex, int rowDepth, RowType rowType, int columnIndex,
-            string cellValue,
+            ColumnType columnType, string cellValue,
             bool isVisible, bool isCollapsed
             )
         {
@@ -423,7 +446,7 @@ namespace dotnet_excel_utilities
             DocumentFormat.OpenXml.Spreadsheet.Cell newCell = new DocumentFormat.OpenXml.Spreadsheet.Cell()
             {
                 CellReference = cellReferenceStr,
-                DataType = CellValues.String,
+                DataType = GetCellValueType(columnType),
                 CellValue = new CellValue(cellValue)
             };
 
@@ -462,14 +485,14 @@ namespace dotnet_excel_utilities
             mergeCells.Append(mergeCell);
         }
 
-        private static string GetCellValue(Cell cell, SharedStringTable sharedStringTable = null)
+        private static object GetCellValue(ColumnType columnType, Cell cell, SharedStringTable sharedStringTable = null)
         {
-            string value = default(string);
+            object value = GetColumnTypeDefaultValue(columnType);
 
             try
             {
                 string valueStr = cell.InnerText;
-
+                
                 // If the cell represents an integer number, you are done. 
                 // For dates, this code returns the serialized value that 
                 // represents the date. The code handles strings and 
@@ -488,37 +511,56 @@ namespace dotnet_excel_utilities
                             // the table.
                             if (sharedStringTable != null)
                             {
-                                value = sharedStringTable.ElementAt(int.Parse(valueStr)).InnerText;
+                                valueStr = Convert.ToString(sharedStringTable.ElementAt(int.Parse(valueStr)).InnerText);
                             }
                             break;
 
                         case CellValues.Boolean:
-                            switch (valueStr)
+                            switch (valueStr?.ToUpper())
                             {
+                                case "FALSE":
                                 case "0":
-                                    value = "FALSE";
+                                    valueStr = "FALSE";
                                     break;
                                 default:
-                                    value = "TRUE";
+                                    valueStr = "TRUE";
                                     break;
                             }
                             break;
-                        
-                        case CellValues.String:
-                        case CellValues.InlineString:
-                        default:
-                            value = (string)valueStr;
-                            break;
                     }
                 }
-                else
+
+                switch (columnType)
                 {
-                    value = (string)valueStr;
+                    case ColumnType.Int32:
+                        value = Convert.ToInt32(valueStr);
+                        break;
+                    
+                    case ColumnType.Int64:
+                        value = Convert.ToInt64(valueStr);
+                        break;
+
+                    case ColumnType.Decimal:
+                        value = Convert.ToDecimal(valueStr);
+                        break;
+
+                    case ColumnType.Boolean:
+                        value = Convert.ToBoolean(valueStr);
+                        break;
+
+                    case ColumnType.DateTime:
+                        value = Convert.ToDateTime(valueStr);
+                        break;
+                    
+                    case ColumnType.String:
+                    default:
+                        value = Convert.ToString(valueStr);
+                        break;
                 }
             }
             catch (System.Exception)
             {
-                value = default(string);
+                value = GetColumnTypeDefaultValue(columnType);
             }
 
             return value;
@@ -617,6 +659,52 @@ namespace dotnet_excel_utilities
             }
             
             return m.Groups[1].Value.ToUpper();
+        }
+
+        private static CellValues GetCellValueType(ColumnType columnType)
+        {
+            switch (columnType)
+            {
+                case ColumnType.Int32:
+                case ColumnType.Int64:
+                case ColumnType.Decimal:
+                    return CellValues.Number;
+                
+                case ColumnType.Boolean:
+                    return CellValues.Boolean;
+
+                case ColumnType.DateTime:
+                    return CellValues.Date;
+                
+                case ColumnType.String:
+                default:
+                    return CellValues.String;
+            }
+        }
+
+        private static object GetColumnTypeDefaultValue(ColumnType columnType)
+        {
+            switch (columnType)
+            {
+                case ColumnType.Int32:
+                    return default(Int32);
+                
+                case ColumnType.Int64:
+                    return default(Int64);
+
+                case ColumnType.Decimal:
+                    return default(Decimal);
+
+                case ColumnType.Boolean:
+                    return default(Boolean);
+
+                case ColumnType.DateTime:
+                    return default(DateTime);
+                
+                case ColumnType.String:
+                default:
+                    return default(String);
+            }
         }
 
         #endregion Helpers
